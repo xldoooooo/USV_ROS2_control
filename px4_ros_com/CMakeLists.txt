@@ -26,7 +26,13 @@ target_include_directories(frame_transforms PUBLIC
 	$<INSTALL_INTERFACE:include/${PROJECT_NAME}>
 )
 
-add_executable(offboard_control_boat src/myControl/offboard_control_boat.cpp)
+add_executable(offboard_control_boat 
+	src/myControl/offboard_control_boat.cpp
+	src/myControl/mode_point_stabilization.cpp
+	src/myControl/mode_heading_stabilization.cpp
+	src/myControl/mode_idle.cpp
+	src/myControl/FSM.cpp
+	src/myControl/keyboard_input.cpp)
 ament_target_dependencies(offboard_control_boat rclcpp px4_msgs Eigen3)
 
 ament_export_dependencies(ament_cmake rclcpp eigen3_cmake_module Eigen3 px4_msgs geometry_msgs sensor_msgs)
