@@ -32,16 +32,22 @@ using namespace std::chrono;
 using namespace std::chrono_literals;
 using namespace px4_msgs::msg;
 
+// 船的运动模式枚举
+enum class BoatControlMode {
+	IDLE,                  // 空闲模式（不控制）
+	POINT_STABILIZATION,   // 点镇定模式：从当前位置驶向指定点
+};
+
 class OffboardControlBoat : public rclcpp::Node
 {
 public:
 	OffboardControlBoat() : Node("offboard_control_boat"), 
 		current_nav_state_(0),
 		position_xy_des{0.0f, 0.0f},
-		heading_ref_(0.0f),
 		input_active_(false),
 		position_initialized_(false),
-		shutdown_keyboard_(false)
+		shutdown_keyboard_(false),
+		current_mode_(BoatControlMode::IDLE),
 	{
 		// 参数可通过launch或ROS参数服务器覆盖
 		mass_ = this->declare_parameter("mass", 11.8f);
@@ -52,10 +58,11 @@ public:
 		k4_rate_gain_ = this->declare_parameter("k4_rate_gain", 2.0f);
 		max_speed_ = this->declare_parameter("max_speed", 0.8f);
 		max_thrust_ = this->declare_parameter("max_thrust", 6.0f);
-		control_threshold_ = this->declare_parameter("control_threshold", 2.0f);
+		idle_threshold_ = this->declare_parameter("idle_threshold", 2.0f);
+		area_threshold_ = this->declare_parameter("area_threshold", 5.0f);
 		yaw_rate_limit_ = this->declare_parameter("yaw_rate_limit", 0.3f);
-		heading_tolerance_rad_ = static_cast<float>(this->declare_parameter("heading_tolerance_deg", 10.0) * 3.14159265358979323846 / 180.0);
-		T_test_ = this->declare_parameter("T_test", 2.0f);
+		heading_tolerance_rad_ = static_cast<float>(this->declare_parameter("heading_tolerance_deg", 5.0) * 3.14159265358979323846 / 180.0);
+		T_test_ = this->declare_parameter("T_test", -0.16f);
 		
 		// 打印所有加载的参数值以供调试
 		RCLCPP_INFO(this->get_logger(), "参数加载完成:");
@@ -67,7 +74,8 @@ public:
 		RCLCPP_INFO(this->get_logger(), "  k4_rate_gain: %.2f", k4_rate_gain_);
 		RCLCPP_INFO(this->get_logger(), "  max_speed: %.2f", max_speed_);
 		RCLCPP_INFO(this->get_logger(), "  max_thrust: %.2f", max_thrust_);
-		RCLCPP_INFO(this->get_logger(), "  control_threshold: %.2f", control_threshold_);
+		RCLCPP_INFO(this->get_logger(), "  idle_threshold: %.2f", idle_threshold_);
+		RCLCPP_INFO(this->get_logger(), "  area_threshold: %.2f", area_threshold_);
 		RCLCPP_INFO(this->get_logger(), "  yaw_rate_limit: %.2f", yaw_rate_limit_);
 		RCLCPP_INFO(this->get_logger(), "  heading_tolerance_deg: %.2f", heading_tolerance_rad_ * 180.0f / 3.14159265358979323846f);
 		RCLCPP_INFO(this->get_logger(), "  T_test: %.2f", T_test_);
@@ -98,9 +106,12 @@ public:
 				} else if (name == "max_thrust") {
 					if (value <= 0.0) { result.successful = false; result.reason = "max_thrust must be positive"; break; }
 					max_thrust_ = static_cast<float>(value);
-				} else if (name == "control_threshold") {
-					if (value <= 0.0) { result.successful = false; result.reason = "control_threshold must be positive"; break; }
-					control_threshold_ = static_cast<float>(value);
+				} else if (name == "idle_threshold") {
+					if (value <= 0.0) { result.successful = false; result.reason = "idle_threshold must be positive"; break; }
+					idle_threshold_ = static_cast<float>(value);
+				} else if (name == "area_threshold") {
+					if (value <= 0.0) { result.successful = false; result.reason = "area_threshold must be positive"; break; }
+					area_threshold_ = static_cast<float>(value);
 				} else if (name == "yaw_rate_limit") {
 					if (value <= 0.0) { result.successful = false; result.reason = "yaw_rate_limit must be positive"; break; }
 					yaw_rate_limit_ = static_cast<float>(value);
@@ -161,16 +172,16 @@ public:
 					position_xy_des = Eigen::Vector2f(msg->position[0], msg->position[1]);
 				// 初始化期望航向为当前航向
 				float q0 = msg->q[0], q1 = msg->q[1], q2 = msg->q[2], q3 = msg->q[3];
-				heading_ref_ = std::atan2(2.0f * (q0*q3 + q1*q2), 1.0f - 2.0f * (q2*q2 + q3*q3));
+				float yaw0 = std::atan2(2.0f * (q0*q3 + q1*q2), 1.0f - 2.0f * (q2*q2 + q3*q3));
 				position_initialized_ = true;
 				RCLCPP_INFO(this->get_logger(), "目标位置已初始化为当前位置: x=%.2f, y=%.2f, 航向=%.1f°", 
-					msg->position[0], msg->position[1], heading_ref_ * 180.0f / 3.14159f);
+					msg->position[0], msg->position[1], yaw0 * 180.0f / 3.14159f);
 				}
 			});
 
 		// 启动键盘监听线程
 		keyboard_thread_ = std::thread(&OffboardControlBoat::keyboard_input_thread, this);
-		RCLCPP_INFO(this->get_logger(), "键盘控制已启动。输入格式: x y (例如: 5.0 3.0)\n按空格键暂停/继续控制");
+		RCLCPP_INFO(this->get_logger(), "键盘控制已启动。输入格式: x y (例如: 5.0 3.0)\n");
 
 		// 单次1秒定时器：切换到Offboard并解锁
 		offboard_switch_timer_ = this->create_wall_timer(1s, [this]() {
@@ -183,7 +194,29 @@ public:
 		// 100Hz控制循环定时器
 		auto timer_callback = [this]() -> void {
 			if (current_nav_state_ == 14) {
-					publish_thrust_torque_setpoint();
+					// 根据当前模式执行相应的控制逻辑
+					std::lock_guard<std::mutex> lock(mode_mutex_);
+					switch(current_mode_) {
+						case BoatControlMode::IDLE:
+							// 空闲模式，不发送控制指令
+							break;
+						case BoatControlMode::POINT_STABILIZATION:
+							mode_point_stabilization();
+							publish_thrust_torque_setpoint();
+							break;
+						case BoatControlMode::AREA_KEEPING:
+							mode_area_keeping();
+							publish_thrust_torque_setpoint();
+							break;
+						case BoatControlMode::PATH_FOLLOWING:
+							mode_path_following();
+							publish_thrust_torque_setpoint();
+							break;
+						case BoatControlMode::HEADING_KEEPING:
+							mode_heading_keeping();
+							publish_thrust_torque_setpoint();
+							break;
+					}
 			} else {
 				static int warn_counter = 0;
 				if (++warn_counter % 300 == 0) {  // 先加一，再整除，每3秒输出一次
@@ -240,21 +273,33 @@ private:
 	float control_threshold_{};
 	float yaw_rate_limit_{};
 	float heading_tolerance_rad_{};
+	float heading_keeping_rad_{};
 	float T_test_{};
 
 	// 键盘输入相关
 	Eigen::Vector2f position_xy_des;   //!< 目标位置 (x, y)
-	float heading_ref_;                //!< 平滑的期望航向
 	std::atomic<bool> input_active_;    //!< 是否有新的键盘输入
 	std::atomic<bool> position_initialized_;  //!< 位置是否已初始化
 	std::atomic<bool> shutdown_keyboard_;  //!< 键盘线程关闭标志
 	std::thread keyboard_thread_;       //!< 键盘输入线程
 	std::mutex position_mutex_;         //!< 保护目标位置的互斥锁
 
+	// === 运动模式相关 ===
+	BoatControlMode current_mode_;      //!< 当前运动模式
+	std::mutex mode_mutex_;             //!< 保护模式切换的互斥锁
+	
+	// 区域保持模式参数
+	Eigen::Vector2f area_center_;       //!< 区域中心位置
+	float area_radius_;                 //!< 区域半径（米）
+
 	void keyboard_input_thread();       //!< 键盘输入线程函数
 	void publish_offboard_control_mode();
 	void publish_vehicle_command(uint16_t command, float param1 = 0.0, float param2 = 0.0);
 	void publish_thrust_torque_setpoint();
+	
+	// === 运动模式控制函数 ===
+	void set_mode(BoatControlMode mode);                    //!< 设置运动模式
+	void mode_point_stabilization();                        //!< 点稳定模式控制
 };
 
 // 解锁无人艇
@@ -303,10 +348,10 @@ void OffboardControlBoat::publish_thrust_torque_setpoint()
 	Eigen::Vector2f position_xy(position_[0], position_[1]);
 	float distance_to_target = (position_xy - position_xy_des).norm();
 	
-		// 计算指向目标的期望旋转矩阵
+	// 计算指向目标的期望旋转矩阵
 	Eigen::Matrix2f R_des;
 	// Eigen::Vector2f R1_des = (position_xy_des - position_xy).normalized();
-	Eigen::Vector2f R1_des = {0,1};
+	Eigen::Vector2f R1_des = {1, 0};
 	double psi_des = std::atan2(R1_des.y(), R1_des.x());
 	Eigen::Matrix2f R_90;
 	R_90 << 0.0f, -1.0f,
@@ -320,11 +365,11 @@ void OffboardControlBoat::publish_thrust_torque_setpoint()
 	// 如果姿态误差小于3度，则不进行转向控制
 	Eigen::Vector2f R1 = R.col(0);
 	Eigen::Matrix2f R_5_p;
-	R_5_p << std::cos(5.0f * M_PI / 180.0), -std::sin(5.0f * M_PI / 180.0),
-	        std::sin(5.0f * M_PI / 180.0),  std::cos(5.0f * M_PI / 180.0);
+	R_5_p << std::cos(heading_keeping_rad_), -std::sin(heading_keeping_rad_),
+	        std::sin(heading_keeping_rad_),  std::cos(heading_keeping_rad_);
 	Eigen::Matrix2f R_5_n;
-	R_5_n << std::cos(-5.0f * M_PI / 180.0), -std::sin(-5.0f * M_PI / 180.0),
-	        std::sin(-5.0f * M_PI / 180.0),  std::cos(-5.0f * M_PI / 180.0);
+	R_5_n << std::cos(-heading_keeping_rad_), -std::sin(-heading_keeping_rad_),
+	        std::sin(-heading_keeping_rad_),  std::cos(-heading_keeping_rad_);
 	Eigen::Vector2f R1_des_r = R_5_p * R1_des;
 	Eigen::Vector2f R2_des_r;
 	Eigen::Vector2f R1_des_l = R_5_n * R1_des;
@@ -335,7 +380,7 @@ void OffboardControlBoat::publish_thrust_torque_setpoint()
 	float r = angular_velocity_[2]; // 当前偏航角速度
 	float cos_angle = R1.dot(R1_des);
 	float angle;
-	if (cos_angle > std::cos(5.0 * M_PI / 180.0)) {
+	if (cos_angle > std::cos(heading_keeping_rad_)) {
 		Tauz = 0.0f;
 	}else if (R1.dot(R1_des_r) > R1.dot(R1_des_l)) {
 		// 右转更近
@@ -372,7 +417,7 @@ void OffboardControlBoat::publish_thrust_torque_setpoint()
 		msg_thrust.timestamp = this->get_clock()->now().nanoseconds() / 1000;
 
 		VehicleTorqueSetpoint msg_torque{};
-		msg_torque.xyz = {0.0, 0.0, 0.0};
+		msg_torque.xyz = {0.0, 0.0, Tauz};
 		msg_torque.timestamp = this->get_clock()->now().nanoseconds() / 1000;
 		vehicle_thrust_setpoint_publisher_->publish(msg_thrust);
 		vehicle_torque_setpoint_publisher_->publish(msg_torque);
@@ -388,28 +433,6 @@ void OffboardControlBoat::publish_thrust_torque_setpoint()
 		}
 		return;
 	}
-	
-	// // 计算指向目标的期望旋转矩阵
-	// Eigen::Matrix2f R_des;
-	// // Eigen::Vector2f R1_des = (position_xy_des - position_xy).normalized();
-	// Eigen::Vector2f R1_des = {1,0};
-	// double psi_des = std::atan2(R1_des.y(), R1_des.x());
-	// Eigen::Matrix2f R_90;
-	// R_90 << 0.0f, -1.0f,
-	//         1.0f,  0.0f;
-	// Eigen::Vector2f R2_des = R_90 * R1_des;
-	// R_des.col(0) = R1_des;
-	// R_des.col(1) = R2_des;
-	
-	// // === 转向控制（优先级最高）===
-	// // 限制期望偏航角速度，避免近距离过度摇摆
-	// Eigen::Matrix2f error_R = R.transpose() * R_des - R_des.transpose() * R;
-	// float r_ref = k3_attitude_gain_ * 0.5f * error_R(1,0); // 期望偏航角速度
-	// float r_ref_lim = yaw_rate_limit_; // rad/s
-	// if (r_ref > r_ref_lim) r_ref = r_ref_lim;
-	// if (r_ref < -r_ref_lim) r_ref = -r_ref_lim;
-	// float r = angular_velocity_[2]; // 当前偏航角速度
-	// float Tauz = inertia_z_ * (-k4_rate_gain_ * (r - r_ref));
 	
 	// === 推力控制 ===
 	float T = 0.0f;
@@ -493,11 +516,19 @@ void OffboardControlBoat::publish_vehicle_command(uint16_t command, float param1
 	vehicle_command_publisher_->publish(msg);
 }
 
-//键盘输入线程函数：持续监听键盘输入并解析x、y坐标
+//键盘输入线程函数：持续监听键盘输入并解析x、y坐标或命令
 void OffboardControlBoat::keyboard_input_thread()
 {
 	std::string line;
-	std::cout << "\n请输入目标位置 (x y): ";
+	std::cout << "\n========================================" << std::endl;
+	std::cout << "船控制命令帮助:" << std::endl;
+	std::cout << "  x y           - 设置目标位置 (例如: 5.0 3.0)" << std::endl;
+	std::cout << "  mode <num>    - 切换模式: 0=空闲 1=点稳定 2=区域保持 3=路径跟踪 4=航向保持" << std::endl;
+	std::cout << "  area x y r    - 设置区域保持参数 (中心x y, 半径r)" << std::endl;
+	std::cout << "  waypoint x y  - 添加航点" << std::endl;
+	std::cout << "  clearwp       - 清空航点列表" << std::endl;
+	std::cout << "========================================" << std::endl;
+	std::cout << "\n请输入命令: ";
 	std::cout.flush();
 	
 	while (!shutdown_keyboard_ && rclcpp::ok()) {
@@ -513,30 +544,102 @@ void OffboardControlBoat::keyboard_input_thread()
 			// 有数据可用
 			if (std::getline(std::cin, line)) {
 				if (line.empty()) {
-					std::cout << "\n请输入目标位置 (x y): ";
+					std::cout << "\n请输入命令: ";
 					std::cout.flush();
 					continue;
 				}
 				
 				std::istringstream iss(line);
-				float x, y;
+				std::string command;
+				iss >> command;
 				
-				if (iss >> x >> y) {
-					{
-						std::lock_guard<std::mutex> lock(position_mutex_);
-						position_xy_des = Eigen::Vector2f(x, y);
-						input_active_ = true;
+				// 模式切换命令
+				if (command == "mode") {
+					int mode_num;
+					if (iss >> mode_num) {
+						if (mode_num >= 0 && mode_num <= 4) {
+							set_mode(static_cast<BoatControlMode>(mode_num));
+						} else {
+							RCLCPP_WARN(this->get_logger(), "模式编号无效！请使用 0-4");
+						}
+					} else {
+						RCLCPP_WARN(this->get_logger(), "请指定模式编号");
 					}
-					RCLCPP_INFO(this->get_logger(), "\n目标位置已更新: x=%.2f, y=%.2f", x, y);
-				} else {
-					RCLCPP_WARN(this->get_logger(), "\n输入格式错误！请使用格式: x y (例如: 5.0 3.0)");
+				}
+				// 区域保持参数设置
+				else if (command == "area") {
+					float x, y, r;
+					if (iss >> x >> y >> r) {
+						set_area_keeping(x, y, r);
+					} else {
+						RCLCPP_WARN(this->get_logger(), "格式错误！使用: area x y radius");
+					}
+				}
+				// 添加航点
+				else if (command == "waypoint") {
+					float x, y;
+					if (iss >> x >> y) {
+						add_waypoint(x, y);
+					} else {
+						RCLCPP_WARN(this->get_logger(), "格式错误！使用: waypoint x y");
+					}
+				}
+				// 清空航点
+				else if (command == "clearwp") {
+					clear_waypoints();
+				}
+				// 直接输入坐标（兼容原有功能）
+				else {
+					// 尝试解析为 x y 坐标
+					float x, y;
+					std::istringstream iss2(line);
+					if (iss2 >> x >> y) {
+						{
+							std::lock_guard<std::mutex> lock(position_mutex_);
+							position_xy_des = Eigen::Vector2f(x, y);
+							input_active_ = true;
+						}
+						RCLCPP_INFO(this->get_logger(), "\n目标位置已更新: x=%.2f, y=%.2f", x, y);
+					} else {
+						RCLCPP_WARN(this->get_logger(), "\n命令无效！输入 'help' 查看帮助");
+					}
 				}
 				
-				std::cout << "\n请输入目标位置 (x y): ";
+				std::cout << "\n请输入命令: ";
 				std::cout.flush();
 			}
 		}
 	}
+}
+
+/**
+ * @brief 设置船的运动模式
+ * @param mode 要切换到的运动模式
+ */
+void OffboardControlBoat::set_mode(BoatControlMode mode)
+{
+	std::lock_guard<std::mutex> lock(mode_mutex_);
+	if (current_mode_ != mode) {
+		current_mode_ = mode;
+		std::string mode_name;
+		switch(mode) {
+			case BoatControlMode::IDLE:
+				mode_name = "IDLE（空闲）";
+				break;
+			case BoatControlMode::POINT_STABILIZATION:
+				mode_name = "POINT_STABILIZATION（点稳定）";
+				break;
+		}
+		RCLCPP_INFO(this->get_logger(), "运动模式已切换为: %s", mode_name.c_str());
+	}
+}
+
+// 点稳定模式控制
+void OffboardControlBoat::mode_point_stabilization()
+{
+	// 此模式使用现有的控制逻辑
+	// position_xy_des 已在键盘输入中设置
+	// publish_thrust_torque_setpoint()中的控制逻辑已实现点稳定
 }
 
 int main(int argc, char *argv[])
