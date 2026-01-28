@@ -1,0 +1,14 @@
+/offboard_control_boat:
+  ros__parameters:
+    mass: 11.8
+    inertia_z: 0.6
+    k1_position_gain: 0.2
+    k2_velocity_gain: 0.5
+    k3_attitude_gain: 1.0
+    k4_rate_gain: 2.0
+    max_speed: 0.8
+    max_thrust: 6.0
+    control_threshold: 2.0
+    yaw_rate_limit: 1.0
+    heading_tolerance_deg: 10.0
+    T_test: -0.16

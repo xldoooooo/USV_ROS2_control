@@ -1,0 +1,1 @@
+ros2 topic pub --rate 100 /fmu/in/vehicle_torque_setpoint px4_msgs/msg/VehicleTorqueSetpoint "{timestamp: 0, xyz: [0.0, 0.0, 0.2]}"
